@@ -1160,6 +1160,10 @@ class BrowserOperatorTests(unittest.TestCase):
             {"action": "wait_stable", "timeout_ms": 2_000, "stable_ms": 500},
             {"action": "read_text"},
             {"action": "read_records", "max_items": 10},
+            {"action": "read_table", "target": {"role": "table", "accessible_name": "Leads"}},
+            {"action": "read_list", "target": {"role": "list", "accessible_name": "Categories"}},
+            {"action": "copy_text", "target": {"text": "Source text"}},
+            {"action": "paste_text", "target": {"label": "Notes"}, "text": "Copied text"},
             {"action": "wait_stable", "timeout_ms": 2_000, "stable_ms": 500},
             {"action": "open_tab", "url": "https://example.test/other"},
             {"action": "switch_tab", "title": "Example"},
@@ -1172,10 +1176,182 @@ class BrowserOperatorTests(unittest.TestCase):
 
         validated = BrowserOperator.validate_task({
             "task_id": str(uuid.uuid4()),
+            "authorization": {
+                "allowed_origins": ["https://example.test"],
+                "allow_credit_consumption": True,
+            },
             "actions": actions,
         })
 
         self.assertEqual(validated["actions"], actions)
+
+    def test_research_requires_credit_authorization_and_scoped_public_origin(self):
+        task = {
+            "task_id": str(uuid.uuid4()),
+            "query": "dentists",
+            "start_url": "https://directory.example/search",
+        }
+        with self.assertRaisesRegex(ValueError, "allow_credit_consumption"):
+            BrowserOperator.validate_task({**task, "authorization": {
+                "allowed_origins": ["https://directory.example"],
+            }}, require_scope=True)
+        with self.assertRaisesRegex(ValueError, "allow_external_effects"):
+            BrowserOperator.validate_task({
+                "task_id": str(uuid.uuid4()),
+                "goal": "Atualizar cadastro",
+                "actions": [{"action": "fill", "target": {"label": "Name"}, "value": "A"}],
+                "authorization": {"allowed_origins": ["https://directory.example"]},
+            }, require_scope=True)
+        with self.assertRaisesRegex(ValueError, "goal é obrigatório"):
+            BrowserOperator.validate_task({
+                "task_id": str(uuid.uuid4()),
+                "actions": [{"action": "observe"}],
+                "authorization": {"allowed_origins": ["https://directory.example"]},
+            }, require_scope=True)
+        with self.assertRaisesRegex(ValueError, "allowed_origins"):
+            BrowserOperator.validate_task({**task, "authorization": {
+                "allow_credit_consumption": True,
+            }}, require_scope=True)
+        with self.assertRaisesRegex(ValueError, "fora de authorization.allowed_origins"):
+            BrowserOperator.validate_task({**task, "authorization": {
+                "allowed_origins": ["https://other.example"],
+                "allow_credit_consumption": True,
+            }}, require_scope=True)
+
+    def test_origin_scope_rejects_dns_names_resolving_to_private_addresses(self):
+        self.controller.set_allowed_origins(["https://directory.example"])
+        self.controller._browser.contexts[0].route = lambda *_args: None
+        private_address = [(2, 1, 6, "", ("10.0.0.8", 443))]
+        with (
+            patch.dict("os.environ", {"SCOUT_ALLOW_LOCAL_TEST_ORIGINS": ""}),
+            patch("scout.browser_operator.socket.getaddrinfo", return_value=private_address),
+            self.assertRaisesRegex(ValueError, "não público"),
+        ):
+            self.controller._assert_origin_in_scope("https://directory.example/")
+
+    def test_aborted_out_of_scope_navigation_is_reported_as_operation_failure(self):
+        self.controller.set_allowed_origins(["https://example.test"])
+        def aborted_navigation(*_args):
+            self.controller._blocked_navigations.append("https://other.example/private")
+            return {"clicked": True}
+
+        with patch.object(self.operator, "_run_action", side_effect=aborted_navigation):
+            result = self.operator.execute({
+                "task_id": str(uuid.uuid4()),
+                "authorization": {"allowed_origins": ["https://example.test"]},
+                "actions": [{"action": "click", "target": {
+                    "role": "button", "accessible_name": "Open",
+                }}],
+            })
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("fora de authorization.allowed_origins", result["error"]["message"])
+
+    def test_external_effect_click_is_blocked_without_explicit_permission(self):
+        publish_button = FakeActionLocator(self.page, text="Publish")
+        self.page.roles[("button", "Publish")] = publish_button
+
+        result = self.operator.execute({
+            "task_id": str(uuid.uuid4()),
+            "authorization": {"allowed_origins": ["https://example.test"]},
+            "actions": [{"action": "click", "target": {
+                "role": "button", "accessible_name": "Publish",
+            }}],
+        })
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("allow_external_effects", result["error"]["message"])
+        self.assertEqual(publish_button.click_count, 0)
+
+        create_field = FakeActionLocator(self.page, tag="input", value="")
+        self.page.labels["Create listing"] = create_field
+        self.controller._browser = FakeBrowser(self.page)
+        fill_result = self.operator.execute({
+            "task_id": str(uuid.uuid4()),
+            "authorization": {"allowed_origins": ["https://example.test"]},
+            "actions": [{"action": "fill", "target": {"label": "Create listing"}, "value": "Business"}],
+        })
+        self.assertEqual(fill_result["status"], "failed")
+        self.assertIn("allow_external_effects", fill_result["error"]["message"])
+        self.assertEqual(create_field.value, "")
+
+    def test_enter_requires_external_effect_authorization(self):
+        result = self.operator.execute({
+            "task_id": str(uuid.uuid4()),
+            "authorization": {"allowed_origins": ["https://example.test"]},
+            "actions": [{"action": "press", "key": "Enter"}],
+        })
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("allow_external_effects", result["error"]["message"])
+        self.assertEqual(self.page.keyboard.pressed, [])
+
+    def test_table_list_and_clipboard_actions_are_exposed_by_operator(self):
+        with (
+            patch.object(self.controller, "read_table", return_value={
+                "source_url": self.page.url, "rows": [{"Name": "Observed"}],
+            }) as read_table,
+            patch.object(self.controller, "read_list", return_value={
+                "source_url": self.page.url, "items": [{"text": "Observed item"}],
+            }) as read_list,
+            patch.object(self.controller, "copy_text", return_value="Copied source") as copy_text,
+            patch.object(self.controller, "paste_text", return_value={"pasted": True}) as paste_text,
+        ):
+            result = self.operator.execute({
+                "task_id": str(uuid.uuid4()),
+                "actions": [
+                    {"action": "read_table", "target": {"role": "table", "accessible_name": "Leads"}},
+                    {"action": "read_list", "target": {"role": "list", "accessible_name": "Categories"}},
+                    {"action": "copy_text", "target": {"text": "Source"}},
+                    {"action": "paste_text", "target": {"label": "Notes"}, "text": "Copied source"},
+                ],
+            })
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["result"][0]["rows"][0]["Name"], "Observed")
+        self.assertEqual(result["result"][1]["items"][0]["text"], "Observed item")
+        self.assertEqual(result["result"][2]["text"], "Copied source")
+        read_table.assert_called_once_with(role="table", accessible_name="Leads")
+        read_list.assert_called_once_with(role="list", accessible_name="Categories")
+        copy_text.assert_called_once_with(timeout_ms=5_000, text="Source")
+        paste_text.assert_called_once_with(text="Copied source", timeout_ms=5_000, label="Notes")
+
+    def test_research_adapts_to_observed_pagination_and_keeps_page_evidence(self):
+        page_one = {
+            "title": "Company One",
+            "text": "Company One\nPorto Alegre",
+            "links": [],
+            "source_url": "https://directory.example/search",
+        }
+        page_two = {
+            "title": "Company Two",
+            "text": "Company Two\nPorto Alegre",
+            "links": [],
+            "source_url": "https://directory.example/search?page=2",
+        }
+
+        def click_next(*args, **kwargs):
+            self.page.url = "https://directory.example/search?page=2"
+            return {"clicked": True}
+
+        with (
+            patch.object(self.operator, "_search", return_value={"query": "restaurants"}),
+            patch.object(self.controller, "read_semantic_records", side_effect=[[page_one], [page_two]]),
+            patch.object(self.controller, "inspectPage", side_effect=[
+                {"buttons": [{"text": "Next page", "disabled": False}]},
+                {"buttons": []},
+            ]),
+            patch.object(self.controller, "capture_page_state", return_value={"text_hash": "updated"}),
+            patch.object(self.controller, "click_button", side_effect=click_next) as click_next_button,
+            patch.object(self.controller, "wait_for_stable_content", return_value={"stable": True}),
+        ):
+            result = self.operator._research({"query": "restaurants", "max_items": 2}, 1_000)
+
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["records"][0]["source_url"], "https://example.test/start")
+        self.assertEqual(result["records"][1]["source_url"], "https://directory.example/search")
+        self.assertEqual(result["pages_read"], 2)
+        click_next_button.assert_called_once_with(text="Next page", timeout_ms=1_000)
 
     def test_operator_rejects_invalid_action_fields_before_execution(self):
         invalid_actions = [
@@ -1296,6 +1472,43 @@ class BrowserOperatorTests(unittest.TestCase):
         self.assertEqual(recovered["operations"][0]["action"], "observe")
         self.assertEqual(recovered["progress"]["completed_actions"], 1)
 
+    def test_research_progress_events_are_persisted_and_recoverable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "state.json"
+            executor = BrowserOperatorExecutor(state_store=V2StateStore(store_path))
+            task = {
+                "task_id": str(uuid.uuid4()),
+                "authorization": {
+                    "allowed_origins": ["https://directory.example"],
+                    "allow_credit_consumption": True,
+                },
+                "actions": [{"action": "research", "query": "cafes"}],
+            }
+
+            def completed(operator, request):
+                operator.on_progress({"phase": "results_observed", "page": 1})
+                operator.on_progress({"phase": "research_completed", "pages_read": 1})
+                return {
+                    "task_id": request["task_id"],
+                    "status": "completed",
+                    "action": {"index": 0, "name": "research"},
+                    "result": [{"count": 1}],
+                    "evidence": [],
+                    "operations": [{"action": "research", "status": "completed"}],
+                }
+
+            with patch.object(BrowserOperator, "execute", autospec=True, side_effect=completed):
+                result = executor.execute(task)
+            recovered = BrowserOperatorExecutor(
+                state_store=V2StateStore(store_path),
+            ).get_result(task["task_id"])
+
+        self.assertEqual([event["phase"] for event in result["progress_events"]], [
+            "results_observed", "research_completed",
+        ])
+        self.assertEqual(recovered["progress_events"], result["progress_events"])
+        self.assertEqual(recovered["progress"]["phase"], "research_completed")
+
     def test_interrupted_operator_keeps_history_and_is_not_replayed(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
@@ -1385,6 +1598,10 @@ class BrowserOperatorTests(unittest.TestCase):
                 result = executor.execute({
                     "task_id": str(uuid.uuid4()),
                     "goal": "Pesquisar empresas",
+                    "authorization": {
+                        "allowed_origins": ["https://example.test"],
+                        "allow_credit_consumption": True,
+                    },
                     "actions": [{"action": "search", "query": "dentistas"}],
                 })
 
@@ -1409,6 +1626,10 @@ class BrowserOperatorTests(unittest.TestCase):
         ):
             result = self.operator.execute({
                 "task_id": str(uuid.uuid4()),
+                "authorization": {
+                    "allowed_origins": ["https://example.test"],
+                    "allow_credit_consumption": True,
+                },
                 "actions": [{"action": "search", "query": "dentistas"}],
             })
 
@@ -1422,6 +1643,11 @@ class BrowserOperatorTests(unittest.TestCase):
             "goal": "Buscar empresas na fonte aprovada",
             "query": "restaurantes",
             "start_url": "https://directory.example/search",
+            "authorization": {
+                "allowed_origins": ["https://directory.example"],
+                "allow_credit_consumption": True,
+                "allow_external_effects": True,
+            },
         }
 
         planned = BrowserOperator.validate_task(task)
@@ -1470,11 +1696,15 @@ class BrowserOperatorTests(unittest.TestCase):
             "inclusion_criteria": ["Atende no salão"],
             "exclusion_criteria": ["franquia"],
             "fields_of_interest": ["company_name", "phone", "source_url"],
+            "authorization": {
+                "allowed_origins": ["https://directory.example"],
+                "allow_credit_consumption": True,
+            },
         }
         validated = BrowserOperator.validate_task(task)
         self.assertEqual(
             [item["action"] for item in validated["actions"]],
-            ["search", "read_records"],
+            ["research"],
         )
         with tempfile.TemporaryDirectory() as directory:
             executor = BrowserOperatorExecutor(
@@ -1514,6 +1744,10 @@ class BrowserOperatorTests(unittest.TestCase):
             "quantity": 2,
             "niche": "restaurantes",
             "fields_of_interest": ["company_name", "phone", "source_url"],
+            "authorization": {
+                "allowed_origins": ["https://directory.example"],
+                "allow_credit_consumption": True,
+            },
         }
         first_browser_result = {
             "task_id": first_task_id,

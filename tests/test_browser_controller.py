@@ -333,7 +333,7 @@ class BrowserControllerTests(unittest.TestCase):
             "ws://127.0.0.1:9223",
             "wss://edge.example:9223",
             "http://localhost:9223",
-            "http://127.0.0.1:9224",
+            "http://127.0.0.1:9225",
         )
         for endpoint in invalid_endpoints:
             with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):

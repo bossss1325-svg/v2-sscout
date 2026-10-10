@@ -1,16 +1,17 @@
 import json
 import logging
+import os
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock
 from typing import Any
 from urllib.parse import urlsplit
 
 from scout.browser_operator import BrowserOperator, BrowserOperatorExecutor
+from scout.boss_interface import validate_secret, verify_request_signature
 from scout.service import ScoutService
 from scout.task_executor import TaskExecutor, _safe_error_message
 from scout.v2_models import Task, TaskStatus
-from scout.v3_executor import V3TaskExecutor
-from scout.v3_models import V3Task
 
 logger = logging.getLogger("scout.api")
 MAX_REQUEST_BYTES = 64_000
@@ -22,7 +23,7 @@ def create_server(
     port: int = 8080,
     task_executor: TaskExecutor | None = None,
     operator_executor: BrowserOperatorExecutor | None = None,
-    v3_task_executor: V3TaskExecutor | None = None,
+    boss_shared_secret: str | bytes | None = None,
 ) -> ThreadingHTTPServer:
     if host != "127.0.0.1":
         raise ValueError("a API só pode escutar em 127.0.0.1")
@@ -30,9 +31,12 @@ def create_server(
     executor_lock = Lock()
     operator_holder = [operator_executor]
     operator_lock = Lock()
-    v3_executor_holder = [v3_task_executor]
-    v3_executor_lock = Lock()
-
+    configured_secret = boss_shared_secret if boss_shared_secret is not None else os.getenv(
+        "SCOUT_BOSS_SHARED_SECRET"
+    )
+    shared_secret = validate_secret(configured_secret) if configured_secret else None
+    nonce_lock = Lock()
+    used_nonces: dict[str, int] = {}
     def get_task_executor() -> TaskExecutor:
         with executor_lock:
             if executor_holder[0] is None:
@@ -45,13 +49,55 @@ def create_server(
                 operator_holder[0] = BrowserOperatorExecutor()
             return operator_holder[0]
 
-    def get_v3_task_executor() -> V3TaskExecutor:
-        with v3_executor_lock:
-            if v3_executor_holder[0] is None:
-                v3_executor_holder[0] = V3TaskExecutor()
-            return v3_executor_holder[0]
-
     class Handler(BaseHTTPRequestHandler):
+        def _authenticate_boss(self, body: bytes = b"") -> bool:
+            if shared_secret is None:
+                self._json(503, {"error": "boss_auth_not_configured"})
+                return False
+            timestamp = self.headers.get("X-Auren-Timestamp", "")
+            nonce = self.headers.get("X-Auren-Nonce", "")
+            signature = self.headers.get("X-Auren-Signature", "")
+            valid = verify_request_signature(
+                shared_secret,
+                self.command,
+                self.path,
+                body,
+                timestamp,
+                nonce,
+                signature,
+            )
+            if not valid:
+                self._json(401, {"error": "invalid_boss_signature"})
+                return False
+            issued_at = int(timestamp)
+            with nonce_lock:
+                expired = [key for key, created in used_nonces.items() if created < int(time.time()) - 300]
+                for key in expired:
+                    used_nonces.pop(key, None)
+                if nonce in used_nonces:
+                    self._json(401, {"error": "replayed_boss_request"})
+                    return False
+                used_nonces[nonce] = issued_at
+            return True
+
+        def _read_authenticated_body(self) -> bytes | None:
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+                if content_length < 1 or content_length > MAX_REQUEST_BYTES:
+                    raise ValueError
+            except ValueError:
+                self._json(400, {"error": "invalid_request_size"})
+                return None
+            body = self.rfile.read(content_length)
+            if len(body) != content_length:
+                self._json(400, {"error": "incomplete_request_body"})
+                return None
+            return body
+
+        def _request_body(self, content_length: int) -> bytes:
+            authenticated_body = getattr(self, "_authenticated_body", None)
+            return authenticated_body if authenticated_body is not None else self.rfile.read(content_length)
+
         def _json(self, status: int, payload: dict) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
@@ -62,6 +108,13 @@ def create_server(
 
         def do_GET(self) -> None:
             path = urlsplit(self.path).path
+            if (
+                path == "/v2/results"
+                or path.startswith("/v2/results/")
+                or path.startswith("/tasks/")
+                or path.startswith("/operator/tasks/")
+            ) and not self._authenticate_boss():
+                return
             if path == "/v2/results" or path == "/v2/results/pending":
                 delivery_status = "pending" if path.endswith("/pending") else None
                 self._json(200, {
@@ -76,28 +129,6 @@ def create_server(
                     self._json(200, package)
                 else:
                     self._json(404, {"error": "result_package_not_found"})
-                return
-            if path == "/v3/health":
-                self._json(200, get_v3_task_executor().health_check())
-                return
-            v3_task_prefix = "/v3/tasks/"
-            v3_task_id = path[len(v3_task_prefix):] if path.startswith(v3_task_prefix) else ""
-            if v3_task_id and "/" not in v3_task_id:
-                result = get_v3_task_executor().get_task(v3_task_id)
-                self._json(200, result) if result is not None else self._json(404, {"error": "task_not_found"})
-                return
-            v3_message_prefix = "/v3/messages/"
-            v3_message_id = path[len(v3_message_prefix):] if path.startswith(v3_message_prefix) else ""
-            if v3_message_id and "/" not in v3_message_id:
-                result = get_v3_task_executor().get_message(v3_message_id)
-                self._json(200, result) if result is not None else self._json(404, {"error": "message_not_found"})
-                return
-            v3_history_prefix = "/v3/history/"
-            recipient_id = path[len(v3_history_prefix):] if path.startswith(v3_history_prefix) else ""
-            if recipient_id and "/" not in recipient_id:
-                from urllib.parse import unquote
-
-                self._json(200, {"messages": get_v3_task_executor().message_history(unquote(recipient_id))})
                 return
             if path == "/health":
                 health = {
@@ -157,13 +188,21 @@ def create_server(
 
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
+            protected_request = (
+                path in {"/tasks", "/operator/tasks"}
+                or (path.startswith("/v2/results/") and path.endswith("/delivery"))
+            )
+            if protected_request:
+                body = self._read_authenticated_body()
+                if body is None:
+                    return
+                if not self._authenticate_boss(body):
+                    return
+                self._authenticated_body = body
             v2_delivery_prefix = "/v2/results/"
             if path.startswith(v2_delivery_prefix) and path.endswith("/delivery"):
                 package_id = path[len(v2_delivery_prefix):-len("/delivery")].strip("/")
                 self._handle_v2_result_delivery(package_id)
-                return
-            if path == "/v3/tasks":
-                self._handle_v3_task()
                 return
             if path == "/tasks":
                 self._handle_task()
@@ -178,7 +217,7 @@ def create_server(
                 content_length = int(self.headers.get("Content-Length", "0"))
                 if content_length < 1 or content_length > MAX_REQUEST_BYTES:
                     raise ValueError("tamanho de requisição inválido")
-                payload = json.loads(self.rfile.read(content_length))
+                payload = json.loads(self._request_body(content_length))
                 if not isinstance(payload, dict):
                     raise ValueError("corpo deve ser um objeto JSON")
                 query, city, state = (payload.get(key) for key in ("query", "city", "state"))
@@ -208,7 +247,7 @@ def create_server(
                 content_length = int(self.headers.get("Content-Length", "0"))
                 if content_length < 1 or content_length > MAX_REQUEST_BYTES:
                     raise ValueError("tamanho de requisição inválido")
-                payload = json.loads(self.rfile.read(content_length))
+                payload = json.loads(self._request_body(content_length))
                 task = Task.from_dict(payload)
             except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
                 self._json(400, {"error": "invalid_task", "message": str(error)})
@@ -227,35 +266,12 @@ def create_server(
             )
             self._json(status_code, result.to_dict())
 
-        def _handle_v3_task(self) -> None:
-            try:
-                content_length = int(self.headers.get("Content-Length", "0"))
-                if content_length < 1 or content_length > MAX_REQUEST_BYTES:
-                    raise ValueError("tamanho de requisição inválido")
-                task = V3Task.from_dict(json.loads(self.rfile.read(content_length)))
-            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
-                self._json(400, {"error": "invalid_v3_task", "message": str(error)})
-                return
-            try:
-                result = get_v3_task_executor().execute(task)
-            except ValueError as error:
-                self._json(409, {"error": "duplicate_task", "message": str(error)})
-                return
-            except Exception as error:
-                logger.exception("Falha ao iniciar tarefa recebida pela API V3")
-                self._json(503, {"error": "v3_task_service_unavailable", "message": str(error)})
-                return
-            status_code = 504 if (result.get("error") or {}).get("code") == "task_timeout" else (
-                500 if result.get("status") == "failed" else 200
-            )
-            self._json(status_code, result)
-
         def _handle_v2_result_delivery(self, package_id: str) -> None:
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
                 if content_length < 1 or content_length > MAX_REQUEST_BYTES:
                     raise ValueError("tamanho de requisição inválido")
-                payload = json.loads(self.rfile.read(content_length))
+                payload = json.loads(self._request_body(content_length))
                 if not isinstance(payload, dict):
                     raise ValueError("corpo deve ser um objeto JSON")
                 status = payload.get("status")
@@ -283,8 +299,8 @@ def create_server(
                 content_length = int(self.headers.get("Content-Length", "0"))
                 if content_length < 1 or content_length > MAX_REQUEST_BYTES:
                     raise ValueError("tamanho de requisição inválido")
-                payload = json.loads(self.rfile.read(content_length))
-                BrowserOperator.validate_task(payload)
+                payload = json.loads(self._request_body(content_length))
+                BrowserOperator.validate_task(payload, require_scope=True)
                 task = payload
             except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
                 self._json(400, {

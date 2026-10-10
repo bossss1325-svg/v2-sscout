@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import logging
+import json
+import ipaddress
 import os
 import re
+import socket
 import threading
 import time
 import uuid
@@ -13,6 +16,7 @@ from urllib.parse import urlsplit
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+from scout.boss_interface import origin_for_url, validate_allowed_origins
 from scout.browser_controller import (
     BrowserController,
     V2_CDP_ENDPOINT,
@@ -48,6 +52,7 @@ _ACTION_FIELDS = {
     "click": {"target", "timeout_ms"},
     "fill": {"target", "value", "timeout_ms"},
     "search": {"query", "target", "submit_target", "timeout_ms"},
+    "research": {"query", "max_items", "timeout_ms"},
     "select": {"target", "option", "timeout_ms"},
     "press": {"key"},
     "scroll": {"target", "delta_x", "delta_y"},
@@ -55,6 +60,10 @@ _ACTION_FIELDS = {
     "wait_stable": {"timeout_ms", "stable_ms"},
     "read_text": {"target", "max_chars"},
     "read_records": {"max_items"},
+    "read_table": {"target"},
+    "read_list": {"target"},
+    "copy_text": {"target", "timeout_ms"},
+    "paste_text": {"target", "text", "timeout_ms"},
     "open_tab": {"url", "timeout_ms"},
     "switch_tab": {"title", "url"},
     "close_tab": {"title", "url"},
@@ -93,6 +102,12 @@ _PROHIBITED_TARGET_PATTERN = re.compile(
     r"purchase|whats\s*app|whatsapp|wa\.me|\bmessage\b|\bmensagem\b|\bsend\b|\benviar\b|\bchat\b",
     re.IGNORECASE,
 )
+_EXTERNAL_EFFECT_PATTERN = re.compile(
+    r"\b(?:publish|publicar|post|send|enviar|submit|create|criar|delete|excluir|remover|"
+    r"save|salvar|buy|purchase|checkout|pay|payment|pagamento|mensagem|message)\b",
+    re.IGNORECASE,
+)
+_CREDIT_CONSUMPTION_PATTERN = re.compile(r"\b(?:search|pesquisar|buscar|find|research)\b", re.I)
 
 
 class V2BrowserController(BrowserController):
@@ -108,13 +123,121 @@ class V2BrowserController(BrowserController):
             raise ValueError(f"O operador V2 aceita somente {V2_CDP_ENDPOINT}")
         super().__init__(cdp_endpoint=endpoint)
 
+    def set_allowed_origins(self, origins: list[str]) -> None:
+        self._allowed_origins = validate_allowed_origins(origins)
+        self._routed_pages: set[int] = set()
+        self._blocked_navigations: list[str] = []
+
+    def consume_blocked_navigation(self) -> str | None:
+        blocked = getattr(self, "_blocked_navigations", [])
+        return blocked.pop(0) if blocked else None
+
+    def _assert_origin_in_scope(self, url: str) -> None:
+        origins = getattr(self, "_allowed_origins", [])
+        if not origins:
+            return
+        try:
+            parts = urlsplit(url)
+            if (
+                parts.scheme not in {"http", "https"}
+                or not parts.hostname
+                or parts.username is not None
+                or parts.password is not None
+                or origin_for_url(url) not in origins
+            ):
+                raise ValueError("Navegação fora de authorization.allowed_origins bloqueada")
+            port = parts.port or (443 if parts.scheme == "https" else 80)
+        except ValueError as error:
+            raise ValueError("URL inválida ou fora de authorization.allowed_origins") from error
+        if os.getenv("SCOUT_ALLOW_LOCAL_TEST_ORIGINS") == "1":
+            return
+        browser = getattr(self, "_browser", None)
+        contexts = getattr(browser, "contexts", []) if browser is not None else []
+        if not any(hasattr(context, "route") for context in contexts):
+            return
+        try:
+            address = ipaddress.ip_address(parts.hostname)
+            addresses = {address}
+        except ValueError:
+            try:
+                addresses = {
+                    ipaddress.ip_address(item[4][0])
+                    for item in socket.getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
+                }
+            except OSError as error:
+                raise ValueError("A origem autorizada não resolveu para um host público") from error
+        if not addresses or any(not address.is_global for address in addresses):
+            raise ValueError("A origem autorizada resolve para endereço não público")
+
+    def _install_navigation_guard(self, page: Any) -> None:
+        if not getattr(self, "_allowed_origins", []):
+            return
+        browser = self._require_browser()
+        context = next((item for item in browser.contexts if page in item.pages), None)
+        if context is None or not hasattr(context, "route"):
+            return
+        routed_contexts = getattr(self, "_routed_contexts", set())
+        if id(context) in routed_contexts:
+            return
+
+        def guard_navigation(route: Any) -> None:
+            request = route.request
+            if request.is_navigation_request():
+                try:
+                    self._assert_origin_in_scope(request.url)
+                except ValueError:
+                    getattr(self, "_blocked_navigations", []).append(request.url)
+                    route.abort()
+                    return
+            route.continue_()
+
+        context.route("**/*", guard_navigation)
+        routed_contexts.add(id(context))
+        self._routed_contexts = routed_contexts
+
     def navigate(self, url: str, timeout_ms: int = 30_000) -> dict[str, str]:
         self._assert_safe_destination(url)
-        return super().navigate(url, timeout_ms)
+        self._assert_origin_in_scope(url)
+        page = self.getActivePage()
+        if page is None:
+            raise RuntimeError("Não há uma aba ativa disponível para navegar")
+        self._install_navigation_guard(page)
+        result = super().navigate(url, timeout_ms)
+        self._assert_origin_in_scope(page.url)
+        return result
 
     def open_new_tab(self, url: str, timeout_ms: int = 30_000) -> dict[str, str]:
         self._assert_safe_destination(url)
-        return super().open_new_tab(url, timeout_ms)
+        self._assert_origin_in_scope(url)
+        browser = self._require_browser()
+        if not browser.contexts:
+            raise RuntimeError("Nenhum contexto de navegador disponível")
+        page = browser.contexts[0].new_page()
+        self._install_navigation_guard(page)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            self._assert_origin_in_scope(page.url)
+        except Exception:
+            page.close()
+            raise
+        page.bring_to_front()
+        self._active_page_override = page
+        return self._tab_info(page)
+
+    def switch_tab(self, *, title: str | None = None, url: str | None = None) -> dict[str, str]:
+        pages = self._pages()
+        matches = [
+            page for page in pages
+            if (title is not None and page.title() == title)
+            or (url is not None and page.url == url)
+        ]
+        if len(matches) > 1:
+            raise HumanInterventionRequired("Aba de destino ambígua")
+        if matches:
+            self._assert_origin_in_scope(matches[0].url)
+        result = super().switch_tab(title=title, url=url)
+        self._assert_origin_in_scope(result["url"])
+        return result
 
     @staticmethod
     def _assert_safe_destination(url: str) -> None:
@@ -362,18 +485,23 @@ class BrowserOperator:
         self,
         controller: V2BrowserController | None = None,
         on_action: Callable[[dict[str, Any]], None] | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.controller = controller or V2BrowserController()
         self.on_action = on_action
+        self.on_progress = on_progress
+        self.progress_events: list[dict[str, Any]] = []
+        self.authorization: dict[str, Any] = {}
 
     @staticmethod
-    def validate_task(task: Any) -> dict[str, Any]:
+    def validate_task(task: Any, *, require_scope: bool = False) -> dict[str, Any]:
         if not isinstance(task, dict):
             raise ValueError("task deve ser um objeto JSON")
         unsupported = set(task) - {
             "task_id", "goal", "query", "quantity", "niche", "locality",
             "inclusion_criteria", "exclusion_criteria", "fields_of_interest",
             "start_url", "actions", "memory",
+            "authorization",
         }
         if unsupported:
             raise ValueError(f"task contém campos não suportados: {', '.join(sorted(unsupported))}")
@@ -387,6 +515,26 @@ class BrowserOperator:
         goal = task.get("goal", "")
         if not isinstance(goal, str) or len(goal) > 500:
             raise ValueError("goal deve ser texto com até 500 caracteres")
+        if require_scope and task.get("query") is None and not goal.strip():
+            raise ValueError("goal é obrigatório para tarefas explícitas do AUREN BOSS")
+        authorization = task.get("authorization", {})
+        if not isinstance(authorization, dict):
+            raise ValueError("authorization deve ser um objeto")
+        unknown_authorization = set(authorization) - {
+            "allowed_origins", "allow_credit_consumption", "allow_external_effects",
+        }
+        if unknown_authorization:
+            raise ValueError("authorization contém campos não suportados")
+        for name in ("allow_credit_consumption", "allow_external_effects"):
+            if name in authorization and not isinstance(authorization[name], bool):
+                raise ValueError(f"authorization.{name} deve ser booleano")
+        allowed_origins = validate_allowed_origins(authorization["allowed_origins"]) \
+            if "allowed_origins" in authorization else []
+        if require_scope and not allowed_origins:
+            raise ValueError("authorization.allowed_origins é obrigatório para tarefas do Boss")
+        authorization = dict(authorization)
+        if allowed_origins:
+            authorization["allowed_origins"] = allowed_origins
         memory = task.get("memory")
         if memory is not None:
             if (
@@ -459,8 +607,15 @@ class BrowserOperator:
                     valid_source = False
                 if not valid_source:
                     raise ValueError("start_url deve ser HTTP(S), público e sem credenciais")
+                if allowed_origins and origin_for_url(start_url.strip()) not in allowed_origins:
+                    raise ValueError("start_url está fora de authorization.allowed_origins")
+            search_terms = [query.strip()]
+            for extra in (niche.strip(), locality.strip()):
+                if extra and extra.casefold() not in query.casefold():
+                    search_terms.append(extra)
             research = {
-                "query": query.strip(),
+                "query": " ".join(search_terms),
+                "requested_query": query.strip(),
                 "quantity": quantity,
                 "inclusion_criteria": criteria["inclusion_criteria"],
                 "exclusion_criteria": criteria["exclusion_criteria"],
@@ -471,8 +626,7 @@ class BrowserOperator:
             }
             actions = ([{"action": "navigate", "url": start_url.strip(), "timeout_ms": 20_000}]
                 if start_url.strip() else []) + [
-                {"action": "search", "query": query.strip(), "timeout_ms": 20_000},
-                {"action": "read_records", "max_items": quantity},
+                {"action": "research", "query": research["query"], "max_items": quantity, "timeout_ms": 20_000},
             ]
         else:
             actions = task.get("actions")
@@ -484,6 +638,22 @@ class BrowserOperator:
             raise ValueError("actions deve ser uma lista não vazia")
         if len(actions) > 50:
             raise ValueError("actions aceita no máximo 50 operações")
+        if any(
+            isinstance(action, dict)
+            and action.get("action") in {"search", "research"}
+            for action in actions
+        ) and authorization.get("allow_credit_consumption") is not True:
+            raise ValueError("authorization.allow_credit_consumption é obrigatório para pesquisar")
+        if require_scope and any(
+            isinstance(action, dict) and (
+                action.get("action") in {"click", "fill", "select", "paste_text"}
+                or (action.get("action") == "press" and action.get("key") == "Enter")
+            )
+            for action in actions
+        ) and authorization.get("allow_external_effects") is not True:
+            raise ValueError(
+                "authorization.allow_external_effects é obrigatório para interações mutáveis"
+            )
         for index, action in enumerate(actions):
             if not isinstance(action, dict):
                 raise ValueError(f"actions[{index}] deve ser um objeto")
@@ -511,8 +681,10 @@ class BrowserOperator:
             submit_target = action.get("submit_target")
             if submit_target is not None:
                 BrowserOperator._validate_target(submit_target, index)
-            if action_name in {"click", "fill", "select"} and target is None:
+            if action_name in {"click", "fill", "select", "read_table", "read_list", "copy_text"} and target is None:
                 raise ValueError(f"actions[{index}].target é obrigatório")
+            if action_name == "paste_text" and (target is None or not isinstance(action.get("text"), str)):
+                raise ValueError(f"actions[{index}] requer target e text textual")
             if action_name == "fill" and not isinstance(action.get("value"), str):
                 raise ValueError(f"actions[{index}].value deve ser texto")
             if action_name == "search" and (
@@ -526,6 +698,14 @@ class BrowserOperator:
                 or not 1 <= action.get("max_items", 200) <= 1_000
             ):
                 raise ValueError(f"actions[{index}].max_items deve estar entre 1 e 1000")
+            if action_name == "research" and (
+                not _nonempty_text(action.get("query"))
+                or len(action["query"]) > 500
+                or isinstance(action.get("max_items", 10), bool)
+                or not isinstance(action.get("max_items", 10), int)
+                or not 1 <= action.get("max_items", 10) <= 10
+            ):
+                raise ValueError(f"actions[{index}] pesquisa exige query e max_items entre 1 e 10")
             if action_name == "read_text" and (
                 isinstance(action.get("max_chars"), bool)
                 or not isinstance(action.get("max_chars", 12_000), int)
@@ -547,6 +727,9 @@ class BrowserOperator:
                 raise ValueError(f"actions[{index}].option deve ser texto não vazio")
             if action_name in {"navigate", "open_tab"} and not _nonempty_text(action.get("url")):
                 raise ValueError(f"actions[{index}].url deve ser texto não vazio")
+            if action_name in {"navigate", "open_tab"} and allowed_origins:
+                if origin_for_url(action["url"]) not in allowed_origins:
+                    raise ValueError(f"actions[{index}].url está fora de authorization.allowed_origins")
             if action_name == "switch_tab":
                 if (
                     (action.get("title") is None) == (action.get("url") is None)
@@ -638,6 +821,7 @@ class BrowserOperator:
                     raise ValueError(f"actions[{index}].url deve ser texto não vazio")
         return {
             "task_id": task_id,
+            "authorization": authorization,
             **({"goal": goal.strip()} if goal.strip() else {}),
             **({"research": research} if research is not None else {}),
             **({"actions": actions} if not memory or "reuse" not in memory else {}),
@@ -694,16 +878,40 @@ class BrowserOperator:
             }
 
         records: list[dict[str, Any]] = []
+        self.authorization = validated["authorization"]
         evidence: list[dict[str, Any]] = []
         failed: dict[str, Any] | None = None
         current_action: dict[str, Any] | None = None
         transition_baseline: dict[str, Any] | None = None
         try:
             self.controller.connect()
+            allowed_origins = self.authorization.get("allowed_origins", [])
+            if allowed_origins:
+                self.controller.set_allowed_origins(allowed_origins)
+                active_tab = self.controller.getActiveTab()
+                active_url = active_tab.get("url", "") if active_tab else ""
+                active_scheme = urlsplit(active_url).scheme.casefold()
+                if active_tab is None or (
+                    active_scheme in {"http", "https"}
+                    and (
+                        origin_for_url(active_url) not in allowed_origins
+                        or not getattr(self.controller, "_allowed_origins", [])
+                    )
+                ) or active_scheme not in {"http", "https", "about", "edge"}:
+                    raise PermissionError("A aba ativa está fora de authorization.allowed_origins")
+                if active_scheme in {"http", "https"}:
+                    self.controller._assert_origin_in_scope(active_url)
             for index, action in enumerate(validated["actions"]):
                 current_action = {"index": index, "name": action["action"]}
                 before = self._observe_state()
                 result = self._run_action(action, before, transition_baseline)
+                consume_blocked = getattr(self.controller, "consume_blocked_navigation", None)
+                blocked_url = consume_blocked() if consume_blocked is not None else None
+                if blocked_url:
+                    raise PermissionError(
+                        "Navegação bloqueada fora de authorization.allowed_origins: "
+                        + BrowserController._safe_page_url(blocked_url)
+                    )
                 after = self._observe_state()
                 record = {
                     "index": index,
@@ -773,6 +981,7 @@ class BrowserOperator:
             "result": [record.get("result") for record in records if record["status"] == "completed"],
             "evidence": evidence,
             "operations": records,
+            "progress_events": deepcopy(self.progress_events),
         }
         if failed is not None:
             output["error"] = failed
@@ -820,6 +1029,13 @@ class BrowserOperator:
             found = self.controller.find_element(**target)
             if not found["found"]:
                 raise RuntimeError("Elemento não encontrado para clique")
+            descriptor = found.get("element", {})
+            target_text = " ".join(str(value) for value in target.values() if isinstance(value, str))
+            observed_text = " ".join(
+                str(descriptor.get(key, ""))
+                for key in ("text", "aria_label", "name", "type")
+            ) if isinstance(descriptor, dict) else ""
+            self._require_external_effect_authorization(f"{target_text} {observed_text}")
             return self.controller.click_element(timeout_ms=timeout, **target)
         if name == "fill":
             target = self._require_target(target)
@@ -827,6 +1043,9 @@ class BrowserOperator:
             found = self.controller.find_element(**target)
             if not found["found"]:
                 raise RuntimeError("Campo não encontrado para preenchimento")
+            self._require_external_effect_authorization(
+                " ".join(str(value) for value in target.values() if isinstance(value, str))
+            )
             primitive_target = self._fill_input_target(target)
             if primitive_target is not None:
                 return self.controller.fill_input(
@@ -837,9 +1056,14 @@ class BrowserOperator:
             )
         if name == "search":
             return self._search(action, timeout)
+        if name == "research":
+            return self._research(action, timeout)
         if name == "select":
             target = self._require_target(target)
             self._assert_action_text_allowed(action["option"])
+            self._require_external_effect_authorization(
+                " ".join((action["option"], *(str(value) for value in target.values() if isinstance(value, str))))
+            )
             self.controller.wait_for_semantic_target(timeout_ms=timeout, **target)
             found = self.controller.find_element(**target)
             if not found["found"]:
@@ -855,6 +1079,10 @@ class BrowserOperator:
             key = action.get("key")
             if not isinstance(key, str):
                 raise ValueError("key deve ser texto")
+            if key == "Enter" and self.authorization.get("allow_external_effects") is not True:
+                raise PermissionError(
+                    "Enter pode submeter formulário e exige authorization.allow_external_effects"
+                )
             self.controller.press_operator_key(key)
             return {"pressed": key}
         if name == "scroll":
@@ -912,6 +1140,19 @@ class BrowserOperator:
                 "records": records,
                 "source_url": self.controller._safe_page_url(page.url),
             }
+        if name == "read_table":
+            return self.controller.read_table(**self._require_target(target))
+        if name == "read_list":
+            return self.controller.read_list(**self._require_target(target))
+        if name == "copy_text":
+            return {"text": self.controller.copy_text(timeout_ms=timeout, **self._require_target(target))}
+        if name == "paste_text":
+            self._require_external_effect_authorization(
+                " ".join(str(value) for value in target.values() if isinstance(value, str))
+            )
+            return self.controller.paste_text(
+                text=action["text"], timeout_ms=timeout, **self._require_target(target)
+            )
         if name == "open_tab":
             return self.controller.open_new_tab(action["url"], timeout_ms=timeout)
         if name == "switch_tab":
@@ -1006,6 +1247,108 @@ class BrowserOperator:
             "submitted_by": self._safe_target(submit_target) if submit_target else submit_label,
             "stable_content": stable,
         }
+
+    def _require_external_effect_authorization(self, descriptor: str) -> None:
+        if (
+            self.authorization.get("allowed_origins")
+            and self.authorization.get("allow_external_effects") is not True
+        ):
+            raise PermissionError(
+                "Interação mutável exige authorization.allow_external_effects"
+            )
+        if (
+            _EXTERNAL_EFFECT_PATTERN.search(descriptor)
+            and self.authorization.get("allow_external_effects") is not True
+        ):
+            raise PermissionError(
+                "Ação com possível efeito externo exige authorization.allow_external_effects"
+            )
+
+    def _research(self, action: dict[str, Any], timeout_ms: int) -> dict[str, Any]:
+        self._search({"query": action["query"], "timeout_ms": timeout_ms}, timeout_ms)
+        max_items = action.get("max_items", 10)
+        records: list[dict[str, Any]] = []
+        seen_pages: set[str] = set()
+        warnings: list[str] = []
+        page_count = 0
+        self._emit_progress({"phase": "search_submitted", "query": action["query"]})
+        while page_count < 100 and len(records) < max_items:
+            page = self.controller.getActivePage()
+            if page is None:
+                raise RuntimeError("Não há uma aba ativa para ler os resultados")
+            source_url = self.controller._safe_page_url(page.url)
+            current = self.controller.read_semantic_records(max_items=max_items)
+            signature = json.dumps(current, sort_keys=True, ensure_ascii=False)
+            if signature in seen_pages:
+                warnings.append("A paginação repetiu conteúdo; a leitura foi interrompida.")
+                break
+            seen_pages.add(signature)
+            self._emit_progress({
+                "phase": "results_observed",
+                "page": page_count + 1,
+                "record_count": len(current),
+                "records_collected": len(records),
+            })
+            if not current:
+                inspection = self.controller.inspectPage()
+                text = inspection.get("text", "")
+                if not re.search(
+                    r"nenhum(?:a)? resultado|sem resultados|não encontramos resultados|nao encontramos resultados|no results|nothing found",
+                    text,
+                    re.I,
+                ):
+                    warnings.append("Nenhum registro semântico foi identificado; não foram inferidos resultados.")
+                break
+            for record in current:
+                record["source_url"] = source_url
+                records.append(record)
+                if len(records) >= max_items:
+                    break
+            page_count += 1
+            if len(records) >= max_items:
+                break
+            inspection = self.controller.inspectPage()
+            next_buttons = [
+                button for button in inspection.get("buttons", [])
+                if isinstance(button, dict)
+                and not button.get("disabled")
+                and re.search(
+                    r"\b(next|pr[oó]xima|avan[cç]ar|mais resultados|ver mais)\b",
+                    " ".join((button.get("text", ""), button.get("aria_label", ""))),
+                    re.I,
+                )
+            ]
+            labels = list(dict.fromkeys(
+                (button.get("text") or button.get("aria_label") or "").strip()
+                for button in next_buttons
+            ))
+            if len(labels) > 1:
+                raise HumanInterventionRequired("Controles de próxima página ambíguos")
+            if not labels:
+                break
+            before = self.controller.capture_page_state()
+            self._emit_progress({"phase": "next_page", "page": page_count + 2})
+            self.controller.click_button(text=labels[0], timeout_ms=timeout_ms)
+            self.controller.wait_for_stable_content(before, timeout_ms=timeout_ms)
+        if page_count >= 100 and len(records) < max_items:
+            warnings.append("Limite de 100 páginas atingido.")
+        self._emit_progress({
+            "phase": "research_completed",
+            "pages_read": page_count,
+            "records_collected": len(records),
+        })
+        return {
+            "query": action["query"],
+            "count": len(records),
+            "records": records,
+            "pages_read": page_count,
+            "warnings": warnings,
+        }
+
+    def _emit_progress(self, event: dict[str, Any]) -> None:
+        self.progress_events.append(deepcopy(event))
+        if self.on_progress is not None:
+            self.on_progress(deepcopy(event))
 
     @staticmethod
     def _input_target(item: dict[str, Any]) -> dict[str, Any]:
@@ -1184,6 +1527,7 @@ class BrowserOperatorExecutor:
                     "evidence": record.get("evidence", []),
                     "operations": record.get("operations", []),
                     "progress": record.get("progress", {}),
+                    "progress_events": record.get("progress_events", []),
                 }
             if record.get("status") in {"queued", "running"} and not self._process_is_alive(
                 record.get("worker_pid")
@@ -1193,6 +1537,8 @@ class BrowserOperatorExecutor:
                     "status": "failed",
                     "operations": deepcopy(record.get("operations", [])),
                     "evidence": deepcopy(record.get("evidence", [])),
+                    "progress": deepcopy(record.get("progress", {})),
+                    "progress_events": deepcopy(record.get("progress_events", [])),
                     "started_at": record.get("started_at"),
                     "finished_at": datetime.now(timezone.utc).isoformat(),
                     "error": {
@@ -1253,6 +1599,7 @@ class BrowserOperatorExecutor:
                     "operations": [],
                     "evidence": [],
                     "progress": {"completed_actions": 0, "total_actions": len(validated.get("actions", []))},
+                    "progress_events": [],
                     "result": None,
                     "worker_pid": os.getpid(),
                     "created_at": now,
@@ -1324,6 +1671,23 @@ class BrowserOperatorExecutor:
                     "name": action_record.get("action"),
                 }
                 record["progress"] = {
+                    **record.get("progress", {}),
+                    "completed_actions": sum(
+                        item.get("status") == "completed" for item in record["operations"]
+                    ),
+                    "total_actions": len(actions),
+                }
+                self.state_store.save_operator_task(task_id, record)
+
+            def persist_progress(progress_event: dict[str, Any]) -> None:
+                event = {
+                    **deepcopy(progress_event),
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                }
+                record.setdefault("progress_events", []).append(event)
+                record["progress"] = {
+                    **record.get("progress", {}),
+                    **deepcopy(progress_event),
                     "completed_actions": sum(
                         item.get("status") == "completed" for item in record["operations"]
                     ),
@@ -1335,9 +1699,11 @@ class BrowserOperatorExecutor:
                 result = BrowserOperator(
                     self._controller_factory(),
                     on_action=persist_action,
+                    on_progress=persist_progress,
                 ).execute({
                     "task_id": task_id,
                     "goal": validated.get("goal", ""),
+                    "authorization": validated.get("authorization", {}),
                     "actions": actions,
                 })
             except Exception as error:
@@ -1371,6 +1737,7 @@ class BrowserOperatorExecutor:
                 result["memory"] = {"reused": memory["reuse"]}
             result["started_at"] = record["started_at"]
             result["finished_at"] = datetime.now(timezone.utc).isoformat()
+            result["progress_events"] = deepcopy(record.get("progress_events", []))
             package_task = {**validated, "actions": deepcopy(actions)}
             result["result_package"] = build_operator_result_package(package_task, result)
             result["data"] = {"package_id": result["result_package"]["package_id"]}
@@ -1384,12 +1751,14 @@ class BrowserOperatorExecutor:
                     "operations": deepcopy(result.get("operations", [])),
                     "evidence": deepcopy(result.get("evidence", [])),
                     "progress": {
+                        **record.get("progress", {}),
                         "completed_actions": sum(
                             item.get("status") == "completed"
                             for item in result.get("operations", [])
                         ),
                         "total_actions": len(actions),
                     },
+                    "progress_events": deepcopy(record.get("progress_events", [])),
                     "started_at": record.get("started_at") or record["created_at"],
                     "finished_at": datetime.now(timezone.utc).isoformat(),
                 })

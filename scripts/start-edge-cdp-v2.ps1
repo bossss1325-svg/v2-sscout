@@ -29,7 +29,7 @@ if ($existingListener) {
     throw 'A porta TCP 9223 ja esta em uso. Nenhum navegador foi iniciado.'
 }
 
-$userDataDir = 'C:\Users\gabriela.pacheco\AppData\Local\AurenScout\EdgeProfile-V2'
+$userDataDir = Join-Path $env:LOCALAPPDATA 'AurenScout\EdgeProfile-V2'
 New-Item -ItemType Directory -Path $userDataDir -Force | Out-Null
 
 $edgeArguments = @(

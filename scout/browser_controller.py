@@ -111,7 +111,43 @@ INSPECT_PAGE_SCRIPT = """() => {
       .map(element => ({
         text: (element.innerText || element.textContent || '').trim(),
         href: safeHref(element.href)
-      }))
+            })),
+        forms: Array.from(document.forms)
+            .filter(visible)
+            .map(form => ({
+                label: form.getAttribute('aria-label') || '',
+                fields: Array.from(form.querySelectorAll('input,textarea,select'))
+                    .filter(visible)
+                    .map(element => ({
+                        type: element.getAttribute('type') || element.tagName.toLowerCase(),
+                        name: element.getAttribute('name') || '',
+                        label: element.getAttribute('aria-label') ||
+                            Array.from(element.labels || []).map(label => label.innerText || label.textContent || '').join(' '),
+                        placeholder: element.getAttribute('placeholder') || ''
+                    })),
+                submitters: Array.from(form.querySelectorAll('button,[role="button"],input[type="submit"]'))
+                    .filter(visible)
+                    .map(element => (element.innerText || element.value || element.getAttribute('aria-label') || '').trim())
+            })),
+        tables: Array.from(document.querySelectorAll('table,[role="table"]'))
+            .filter(visible)
+            .slice(0, 20)
+            .map(table => ({
+                label: table.getAttribute('aria-label') || table.querySelector('caption')?.innerText || '',
+                rows: Array.from(table.querySelectorAll('tr,[role="row"]')).slice(0, 21).map(row =>
+                    Array.from(row.querySelectorAll('th,td,[role="cell"],[role="columnheader"]'))
+                        .map(cell => (cell.innerText || cell.textContent || '').trim())
+                )
+            })),
+        lists: Array.from(document.querySelectorAll('ul,ol,[role="list"]'))
+            .filter(visible)
+            .slice(0, 20)
+            .map(list => ({
+                label: list.getAttribute('aria-label') || '',
+                items: Array.from(list.querySelectorAll(':scope > li,[role="listitem"]'))
+                    .slice(0, 50)
+                    .map(item => (item.innerText || item.textContent || '').trim())
+            }))
   };
 }"""
 INSPECT_CATEGORY_DOM_SCRIPT = """() => {

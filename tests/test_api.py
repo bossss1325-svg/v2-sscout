@@ -2,6 +2,7 @@ import json
 import os
 import threading
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -9,6 +10,7 @@ import uuid
 from unittest.mock import patch
 
 from scout.api import create_server
+from scout.boss_interface import AurenBossV2Interface, signed_request_headers
 from scout.browser_operator import BrowserOperator, BrowserOperatorExecutor
 from scout.discovery import MockSearchProvider
 from scout.service import ScoutService
@@ -16,11 +18,15 @@ from scout.task_executor import TaskExecutor
 from scout.storage import V2StateStore
 from scout.v2_models import V2Lead
 
+BOSS_SECRET = "0123456789abcdef0123456789abcdef"
+
 
 class ApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.server = create_server(ScoutService(MockSearchProvider()), port=0)
+        cls.server = create_server(
+            ScoutService(MockSearchProvider()), port=0, boss_shared_secret=BOSS_SECRET,
+        )
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.base_url = f"http://127.0.0.1:{cls.server.server_address[1]}"
@@ -43,9 +49,25 @@ class ApiTests(unittest.TestCase):
         return response.code, json.loads(response.read())
 
     def post_task(self, payload):
+        body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
-            f"{self.base_url}/tasks", data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST",
+            f"{self.base_url}/tasks", data=body,
+            headers={"Content-Type": "application/json", **signed_request_headers(
+                BOSS_SECRET, "POST", "/tasks", body,
+            )}, method="POST",
+        )
+        try:
+            response = urllib.request.urlopen(request)
+        except urllib.error.HTTPError as error:
+            response = error
+        return response.code, json.loads(response.read())
+
+    def get_task(self, task_id):
+        path = f"/tasks/{task_id}"
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            headers=signed_request_headers(BOSS_SECRET, "GET", path),
+            method="GET",
         )
         try:
             response = urllib.request.urlopen(request)
@@ -102,21 +124,15 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(payload["status"], "completed")
         self.assertFalse(payload["data"]["browser_connected"])
         self.assertEqual(payload["errors"], [])
-        with urllib.request.urlopen(f"{self.base_url}/tasks/{task_id}") as response:
-            stored_result = json.loads(response.read())
+        stored_status, stored_result = self.get_task(task_id)
+        self.assertEqual(stored_status, 200)
         self.assertEqual(stored_result["task_id"], task_id)
         self.assertEqual(stored_result["status"], "completed")
 
     def test_tasks_endpoint_reports_unknown_task(self):
-        request = urllib.request.Request(
-            f"{self.base_url}/tasks/{uuid.uuid4()}",
-            method="GET",
-        )
-        with self.assertRaises(urllib.error.HTTPError) as context:
-            urllib.request.urlopen(request)
-        self.assertEqual(context.exception.code, 404)
-        self.assertEqual(json.loads(context.exception.read())["error"], "task_not_found")
-        context.exception.close()
+        status, payload = self.get_task(str(uuid.uuid4()))
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"], "task_not_found")
 
     def test_tasks_endpoint_rejects_reused_task_id(self):
         task = {
@@ -133,6 +149,41 @@ class ApiTests(unittest.TestCase):
         status, payload = self.post_task({"task_id": "invalid", "type": "NOPE", "payload": {}})
         self.assertEqual(status, 400)
         self.assertEqual(payload["error"], "invalid_task")
+
+    def test_unsigned_task_request_is_rejected(self):
+        body = json.dumps({"task_id": str(uuid.uuid4()), "type": "HEALTH_CHECK", "payload": {}}).encode()
+        request = urllib.request.Request(
+            f"{self.base_url}/tasks", data=body,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(request)
+        self.assertEqual(context.exception.code, 401)
+        self.assertEqual(json.loads(context.exception.read())["error"], "invalid_boss_signature")
+        context.exception.close()
+
+    def test_boss_nonce_cannot_be_replayed(self):
+        path = f"/tasks/{uuid.uuid4()}"
+        headers = signed_request_headers(
+            BOSS_SECRET,
+            "GET",
+            path,
+            timestamp=int(time.time()),
+            nonce="boss-replay-nonce-0001",
+        )
+        request = urllib.request.Request(f"{self.base_url}{path}", headers=headers, method="GET")
+        try:
+            response = urllib.request.urlopen(request)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            self.assertEqual(response.status, 404)
+            response.read()
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(request)
+        self.assertEqual(context.exception.code, 401)
+        self.assertEqual(json.loads(context.exception.read())["error"], "replayed_boss_request")
+        context.exception.close()
 
     def test_operator_endpoint_accepts_generic_structured_task_and_stores_result(self):
         class FakeOperatorExecutor:
@@ -160,28 +211,23 @@ class ApiTests(unittest.TestCase):
             ScoutService(MockSearchProvider()),
             port=0,
             operator_executor=executor,
+            boss_shared_secret=BOSS_SECRET,
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         task_id = str(uuid.uuid4())
         try:
-            request = urllib.request.Request(
-                f"http://127.0.0.1:{server.server_address[1]}/operator/tasks",
-                data=json.dumps({
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            client = AurenBossV2Interface(BOSS_SECRET, base_url)
+            result = client.submit_task({
                     "task_id": task_id,
+                    "goal": "Inspecionar a página controlada",
+                    "authorization": {"allowed_origins": ["https://example.test"]},
                     "actions": [{"action": "observe"}],
-                }).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(request) as response:
-                result = json.loads(response.read())
+                })
             self.assertEqual(result["status"], "completed")
             self.assertEqual(result["action"]["name"], "observe")
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{server.server_address[1]}/operator/tasks/{task_id}"
-            ) as response:
-                stored_result = json.loads(response.read())
+            stored_result = client.get_task(task_id)
             self.assertEqual(stored_result["task_id"], task_id)
         finally:
             server.shutdown()
@@ -197,13 +243,12 @@ class ApiTests(unittest.TestCase):
             ScoutService(MockSearchProvider()),
             port=0,
             task_executor=TaskExecutor(integration=TimeoutIntegration()),
+            boss_shared_secret=BOSS_SECRET,
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            request = urllib.request.Request(
-                f"http://127.0.0.1:{server.server_address[1]}/tasks",
-                data=json.dumps({
+            body = json.dumps({
                     "task_id": str(uuid.uuid4()),
                     "type": "GENERATE_SITE",
                     "payload": {"lead": {"company_name": "Empresa Exemplo"}},
@@ -211,8 +256,13 @@ class ApiTests(unittest.TestCase):
                         "allow_credit_consumption": True,
                         "allow_external_effects": True,
                     },
-                }).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
+                }).encode("utf-8")
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_address[1]}/tasks",
+                data=body,
+                headers={"Content-Type": "application/json", **signed_request_headers(
+                    BOSS_SECRET, "POST", "/tasks", body,
+                )},
                 method="POST",
             )
             with self.assertRaises(urllib.error.HTTPError) as context:
@@ -261,8 +311,9 @@ class V2ResultDeliveryApiTests(unittest.TestCase):
                     "warnings": [],
                 }
 
+        self.search_integration = SearchIntegration()
         executor = TaskExecutor(
-            integration=SearchIntegration(),
+            integration=self.search_integration,
             state_store=self.state_store,
         )
         operator_executor = BrowserOperatorExecutor(state_store=self.state_store)
@@ -271,6 +322,7 @@ class V2ResultDeliveryApiTests(unittest.TestCase):
             port=0,
             task_executor=executor,
             operator_executor=operator_executor,
+            boss_shared_secret=BOSS_SECRET,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -284,10 +336,13 @@ class V2ResultDeliveryApiTests(unittest.TestCase):
 
     def request_json(self, path, payload=None, method="GET"):
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        signed_body = body or b""
         request = urllib.request.Request(
             f"{self.base_url}{path}",
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **signed_request_headers(
+                BOSS_SECRET, method, path, signed_body,
+            )},
             method=method,
         )
         try:
@@ -341,6 +396,55 @@ class V2ResultDeliveryApiTests(unittest.TestCase):
         self.assertEqual(repeated["attempts"], 2)
         self.assertEqual(delivered["status"], "delivered")
 
+    def test_search_package_survives_api_restart_and_is_retrievable_by_boss(self):
+        task_id = str(uuid.uuid4())
+        status, result = self.request_json("/tasks", {
+            "task_id": task_id,
+            "type": "SEARCH_LEADS",
+            "payload": {
+                "city": "Porto Alegre",
+                "state": "RS",
+                "category": "restaurantes",
+                "quantity": 1,
+            },
+            "authorization": {
+                "authorized_by": "auren",
+                "allow_credit_consumption": True,
+            },
+        }, "POST")
+        self.assertEqual(status, 200)
+        package_id = result["result_package"]["package_id"]
+
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        restarted_executor = TaskExecutor(
+            integration=self.search_integration,
+            state_store=V2StateStore(self.state_store.path),
+        )
+        restarted_operator = BrowserOperatorExecutor(
+            state_store=V2StateStore(self.state_store.path),
+        )
+        self.server = create_server(
+            ScoutService(MockSearchProvider()),
+            port=0,
+            task_executor=restarted_executor,
+            operator_executor=restarted_operator,
+            boss_shared_secret=BOSS_SECRET,
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+        task_status, stored_task = self.request_json(f"/tasks/{task_id}")
+        package_status, package = self.request_json(f"/v2/results/{package_id}")
+
+        self.assertEqual(task_status, 200)
+        self.assertEqual(package_status, 200)
+        self.assertEqual(stored_task["task_id"], task_id)
+        self.assertEqual(package["package_id"], package_id)
+        self.assertEqual(package["results"][0]["source_url"], "https://directory.example/company/1")
+
     def test_generic_operator_also_delivers_evidence_package_to_auren(self):
         task_id = str(uuid.uuid4())
         result = {
@@ -355,6 +459,7 @@ class V2ResultDeliveryApiTests(unittest.TestCase):
             status, operator_result = self.request_json("/operator/tasks", {
                 "task_id": task_id,
                 "goal": "Inspecionar página de resultados",
+                "authorization": {"allowed_origins": ["https://example.test"]},
                 "actions": [{"action": "observe"}],
             }, "POST")
         package_id = operator_result["result_package"]["package_id"]
@@ -377,13 +482,10 @@ class V2ResultDeliveryApiTests(unittest.TestCase):
         browser_result = {
             "task_id": task_id,
             "status": "completed",
-            "action": {"index": 1, "name": "read_records"},
-            "result": [{"query": "restaurantes"}, {"count": 1, "records": [raw_record]}],
+            "action": {"index": 0, "name": "research"},
+            "result": [{"query": "restaurantes restaurantes Porto Alegre, RS", "count": 1, "records": [raw_record]}],
             "evidence": [],
-            "operations": [
-                {"action": "search", "status": "completed"},
-                {"action": "read_records", "status": "completed"},
-            ],
+            "operations": [{"action": "research", "status": "completed"}],
         }
         task = {
             "task_id": task_id,
@@ -394,6 +496,10 @@ class V2ResultDeliveryApiTests(unittest.TestCase):
             "locality": "Porto Alegre, RS",
             "inclusion_criteria": ["Atende no salão"],
             "fields_of_interest": ["company_name", "phone", "source_url"],
+            "authorization": {
+                "allowed_origins": ["https://directory.example"],
+                "allow_credit_consumption": True,
+            },
         }
         with patch.object(BrowserOperator, "execute", return_value=browser_result):
             status, result = self.request_json("/operator/tasks", task, "POST")

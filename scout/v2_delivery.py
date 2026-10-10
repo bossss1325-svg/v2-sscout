@@ -184,6 +184,7 @@ def build_operator_result_package(
             "requested_actions": actions,
             "operations": result.get("operations", []),
             "evidence": result.get("evidence", []),
+            "progress_events": result.get("progress_events", []),
             "results": result.get("result", []),
         },
         "summary": _human_summary(

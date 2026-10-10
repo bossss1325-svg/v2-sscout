@@ -1,6 +1,6 @@
 # AUREN SCOUT
 
-Agente de pesquisa comercial V2 e operador de atendimento V3. O Scout coleta e organiza evidências públicas, audita sinais técnicos observáveis de sites e calcula uma pontuação determinística. A V3 é separada da V2, exige consentimento e aprovação humana para envio, e não se integra automaticamente ao Automaton.
+Agente de pesquisa comercial e operador de navegador V2. O Scout coleta e organiza evidências públicas, audita sinais técnicos observáveis de sites e calcula uma pontuação determinística.
 
 ## Princípio de execução subordinada
 
@@ -15,7 +15,6 @@ O AUREN BOSS decide objetivo, cidade/região, categoria, quantidade, pesquisa, a
 - `scout/website.py`: auditoria HTTP/HTML, com limites de resposta, validação de hosts públicos e respeito a `robots.txt`.
 - `scout/scoring.py`: pontuação e classificação sem dependência de rede ou do provedor.
 - `scout/storage.py`: `LeadStore` em memória para o fluxo legado e estado JSON durável V2 para tarefas, leads, operador genérico e pacotes entregues ao Auren.
-- `scout/v3_models.py`, `scout/v3_executor.py`, `scout/v3_browser.py` e `scout/v3_storage.py`: tarefas de leitura/rascunho/envio V3, adaptador Playwright e histórico/opt-outs persistentes em perfil isolado.
 - `scout/service.py`: coordenação, ordenação e logs da pesquisa.
 - `scout/api.py` e `scout/cli.py`: interface HTTP e inicialização.
 - `scout/browser_controller.py`: conexão e controle isolado do Microsoft Edge via CDP.
@@ -52,7 +51,7 @@ O resultado é `dist\AurenScout-V2.exe`. O nome separado evita sobrescrever um `
 .\dist\AurenScout-V2.exe
 ```
 
-O projeto mantém três instâncias isoladas: **V1 = Fortaleza = CDP `127.0.0.1:9222`**, com o perfil `EdgeProfile`; **V2 = AIVIO = CDP `127.0.0.1:9223`**, com o perfil `EdgeProfile-V2`; **V3 = WhatsApp Web = CDP `127.0.0.1:9224`**, com o perfil `EdgeProfile-V3`. Os scripts de inicialização são separados e não reutilizam perfis.
+O projeto mantém duas instâncias isoladas: **V1 = Fortaleza = CDP `127.0.0.1:9222`**, com o perfil `EdgeProfile`; **V2 = AIVIO = CDP `127.0.0.1:9223`**, com o perfil `EdgeProfile-V2`. Os scripts de inicialização são separados e não reutilizam perfis.
 
 O processo mantém a API local ativa até Ctrl+C. Verificar em outro PowerShell:
 
@@ -110,11 +109,44 @@ Para testar o autocomplete de cidade da V2 sem selecionar uma sugestão ou inici
 
 Passe a cidade que deseja diagnosticar em `--city`. O comando conecta ao CDP V2, localiza o input pelo placeholder `Digite uma cidade...`, clica, preenche o valor recebido sem substituí-lo ou abreviá-lo, aguarda o texto exato da cidade e retorna em JSON as linhas visíveis iniciadas pelo valor solicitado e a contagem de correspondências exatas. Não clica em sugestões, categoria ou “Buscar” e não executa nenhuma tarefa. A leitura textual é diagnóstica; ainda não valida no Edge real que as linhas lidas pertencem ao popup de autocomplete.
 
-O `BrowserController` também oferece primitivas explícitas reutilizáveis para clique simples/duplo, formulários, dropdowns, teclado/clipboard, navegação e abas, rolagem, espera por elemento/texto/URL/mudança, leitura de atributos/tabelas/listas, estado, downloads e upload de arquivo explicitamente solicitado. A resolução prioriza role/nome acessível, texto exato, labels/placeholder e atributos estáveis; alvos visíveis ambíguos falham. Classes CSS não são usadas como prioridade. O Browser Controller e o operador genérico V2 bloqueiam WhatsApp; somente o adaptador V3 dedicado em 9224 possui ações de conversa. Os fluxos V2 `SEARCH_LEADS`, `OPEN_COMPANY` e `GENERATE_SITE` usam as primitivas V2. A ausência ou ambiguidade de um controle obrigatório falha explicitamente.
+O `BrowserController` oferece primitivas explícitas para interação, leitura de páginas, formulários, clipboard, tabelas/listas, navegação, abas, rolagem e espera. O `BrowserOperator` expõe essas ações por contrato de tarefa, usa seletores semânticos/acessíveis e falha em alvos ambíguos. A ação `research` observa controles e resultados reais, identifica um único campo e botão de pesquisa, lê records semânticos e segue paginação previsível observada, parando em repetição, ausência de resultados ou limite de 100 páginas. Registros mantêm URL de origem sanitizada e texto observado; campos ausentes permanecem não verificados. A pesquisa declarativa combina `query`, nicho e localidade e limita a quantidade a 10. O operador bloqueia controles de pagamento e comunicação; ações com possível efeito externo exigem autorização separada.
 
-Para tarefas operacionais genéricas enviadas pelo AUREN, a API expõe `POST /operator/tasks` e `GET /operator/tasks/{task_id}`. Esse fluxo persistente usa o Edge V2 em 9223, não exige reconhecer AIVIO e retém ações/evidências após reinício. O Auren pode enviar uma sequência explícita `actions` ou uma pesquisa declarativa com `query`, `goal`, `quantity` (1–10), `niche`, `locality`, `inclusion_criteria`, `exclusion_criteria` e `fields_of_interest`; a V2 planeja `search` seguido de `read_records`. `search` identifica exatamente um campo pelo tipo/labels/placeholder/nome, usa um botão único reconhecível ou Enter somente em `type=search` e espera texto novo estável. `wait_stable` exige hash textual diferente e estável; URL sozinha não conclui a espera. `read_records` lê somente roles `article`/`listitem`; ausência desses records gera pacote parcial/vazio, nunca leads inventados. As demais ações explícitas incluem navegação, abas, menus, controles, leitura, rolagem, espera e verificação. Alvos ambíguos deixam a tarefa `needs_human`/HTTP 202; a API não repete a tarefa.
+Para tarefas do AUREN BOSS, a API expõe `POST /operator/tasks`, `GET /operator/tasks/{task_id}` e os endpoints de pacotes V2. O fluxo usa o Edge V2 em 9223, não exige reconhecer AIVIO e persiste progresso, ações, evidências e resultados após reinício. O operador aceita pesquisa declarativa ou ações explícitas; todas as navegações e redirects devem ficar nas origens incluídas em `authorization.allowed_origins`. Pesquisas exigem `allow_credit_consumption: true`; cliques, preenchimentos, seleções, colagens e `Enter` exigem também `allow_external_effects: true`, por poderem produzir efeitos externos no site. O endpoint só aceita tarefas do Boss assinadas com HMAC; `authorized_by` em JSON não autentica o chamador. Alvos ambíguos retornam `needs_human`/HTTP 202 e nunca são escolhidos aleatoriamente.
 
-Resultados estruturados de `/tasks` e do operador genérico são empacotados com `package_id` UUIDv5 determinístico, objetivo, critérios, data/estado, origem e evidência de cada lead, campos ausentes/não verificados, exclusões, duplicatas, erros, limitações e resumo humano. Tarefas, histórico de ações, progresso e pacotes persistem em `SCOUT_V2_STATE_PATH`; tarefas interrompidas viram `failed`, preservam ações concluídas e não retomam o navegador automaticamente. O Auren consulta `GET /v2/results/pending`, recupera por `GET /v2/results/{package_id}` e confirma entrega com `POST /v2/results/{package_id}/delivery` e `{"status":"delivered"}`; falha transitória usa `{"status":"failed","detail":"..."}`. Ack `delivered` repetido é idempotente. Essa interface não chama um serviço remoto do Auren: o consumidor deve buscar e confirmar o pacote.
+Resultados estruturados de `/tasks` e do operador são empacotados com `package_id` UUIDv5 determinístico, objetivo, critérios, data/estado, origem e evidência de cada lead, campos ausentes/não verificados, exclusões, duplicatas, erros, limitações e resumo humano. Tarefas, histórico de ações, progresso e pacotes persistem em `SCOUT_V2_STATE_PATH`; tarefas interrompidas viram `failed`, preservam ações concluídas e não retomam o navegador automaticamente. O Boss consulta `GET /operator/tasks/{task_id}`, lista `GET /v2/results/pending`, recupera `GET /v2/results/{package_id}` e confirma entrega com `POST /v2/results/{package_id}/delivery`. Essas rotas exigem assinatura HMAC.
+
+### Interface Python do AUREN BOSS
+
+Configure `SCOUT_BOSS_SHARED_SECRET` com o mesmo segredo aleatório de pelo menos 32 bytes na API local e no processo do Boss. A API recusa submissões/consultas sem assinatura válida, com timestamp fora da janela de cinco minutos ou nonce repetido. O contrato de tarefa continua sendo JSON validado; o HMAC autentica o chamador e a lista `allowed_origins` limita a navegação, não substituindo a validação do objetivo/permissões.
+
+O módulo `scout.boss_interface` oferece `AurenBossV2Interface.submit_task`, `get_task`, `list_pending_results`, `get_result` e `acknowledge_result`. Exemplo de chamada do processo Boss:
+
+```python
+import os
+import uuid
+from scout.boss_interface import AurenBossV2Interface
+
+boss = AurenBossV2Interface(os.environ["SCOUT_BOSS_SHARED_SECRET"])
+task_id = str(uuid.uuid4())
+submitted = boss.submit_task({
+  "task_id": task_id,
+  "goal": "Encontrar cafeterias em Porto Alegre",
+  "query": "cafeterias",
+  "quantity": 5,
+  "niche": "cafeterias",
+  "locality": "Porto Alegre, RS",
+  "fields_of_interest": ["company_name", "phone", "source_url"],
+  "authorization": {
+    "allowed_origins": ["https://diretorio-publico.example"],
+    "allow_credit_consumption": True,
+  },
+})
+state = boss.get_task(task_id)
+package = boss.get_result(submitted["result_package"]["package_id"])
+boss.acknowledge_result(package["package_id"], "delivered")
+```
+
+A chamada retorna imediatamente após a execução síncrona da tarefa, por exemplo `{"task_id":"<uuid>","status":"completed","result_package":{"package_id":"<uuid>"},"data":{"package_id":"<uuid>"}}`; `get_task` recupera o registro persistido e o pacote contém resultados/evidências. HTTP 202 representa necessidade de intervenção humana. Erros HTTP ou de transporte geram `BossInterfaceError` com `status` e `code`. O consumidor deve guardar o `task_id`, consultar novamente se perder a resposta e só confirmar `delivered` depois de persistir o pacote no Boss.
 
 Exemplo declarativo de tarefa de pesquisa para `POST /operator/tasks`:
 
@@ -163,7 +195,7 @@ O comando que controla o Edge precisa rodar no mesmo Windows do navegador. Um te
    .\scripts\start-edge-cdp-v2.ps1
    ```
 
-   O script V2 fixa CDP em `127.0.0.1:9223` e o perfil em `C:\Users\gabriela.pacheco\AppData\Local\AurenScout\EdgeProfile-V2`. Ele não lê, altera ou reutiliza `EdgeProfile`. Se o site de destino exigir autenticação, faça login manualmente no perfil V2 e mantenha o Edge aberto. Depois, verifique e consulte o Edge V2:
+  O script V2 fixa CDP em `127.0.0.1:9223` e usa `%LOCALAPPDATA%\AurenScout\EdgeProfile-V2`. Ele não lê, altera ou reutiliza `EdgeProfile`. Se o site de destino exigir autenticação, faça login manualmente no perfil V2 e mantenha o Edge aberto. Depois, verifique e consulte o Edge V2:
 
    ```powershell
    Invoke-RestMethod http://127.0.0.1:9223/json/version | ConvertTo-Json -Depth 4
@@ -180,15 +212,6 @@ O comando que controla o Edge precisa rodar no mesmo Windows do navegador. Um te
    ```
 
    `browser-test-city --city "Porto Alegre"` clica no input e digita exatamente a cidade recebida; não seleciona sugestão nem clica em “Buscar”. Substitua o argumento por qualquer cidade enviada pelo AUREN BOSS. O `browser-status` do V2 usa `http://127.0.0.1:9223` por padrão e rejeita o endpoint V1. O status informa conexão, versão reportada por CDP, abas e endpoint; o health da integração também informa o perfil V2 esperado (`EdgeProfile-V2`), sem afirmar que CDP comprovou o diretório de perfil efetivamente usado.
-
-5. Para iniciar o Edge V3, use o perfil isolado e a porta exclusiva:
-
-  ```powershell
-  .\scripts\start-edge-cdp-v3.ps1
-  Invoke-RestMethod http://127.0.0.1:9224/json/version | ConvertTo-Json -Depth 4
-  ```
-
-  O perfil é `%LOCALAPPDATA%\AurenScout\EdgeProfile-V3`; o script não reutiliza V1/V2 e não remove dados. Abra e autentique manualmente o WhatsApp Web. A API V3 (`/v3/health`, `/v3/tasks`) só se conecta ao perfil existente quando uma tarefa é solicitada; não abre páginas nem inicia conversas automaticamente.
 
    Para executar `browser-status` V1 com a aplicação V1 já instalada, mantenha o endpoint em `http://127.0.0.1:9222`; não use o executável V2 para se conectar ao Edge V1. Se o projeto estiver em Codespaces, faça um clone local no Windows e execute os comandos a partir dele — não execute o cliente CDP no terminal remoto.
 
@@ -246,34 +269,6 @@ Consulte uma tarefa, inclusive enquanto aguarda execução, com `GET http://127.
 
 Como o AIVIO não fornece neste repositório um contrato estável de DOM/URL, a interação usa rótulos acessíveis e estrutura HTML semântica visível. A extração de resultados usa roles `article`/`listitem`; se não estiverem presentes, não há evidência de resultado estruturado. A geração não foi validada contra uma sessão AIVIO real neste ambiente. Não foram executadas buscas reais nem geração de sites; esses fluxos foram testados com mocks. Se o controle acessível, os roles ou o sinal de sucesso não forem reconhecidos, a tarefa falha explicitamente ou retorna aviso, em vez de inventar um resultado. **Seleção da cidade/UF, categoria, paginação e extração ainda precisam de validação com AIVIO real no Windows**; o comando `browser-test-city` não seleciona a cidade nem aciona busca.
 
-## Operação V3 de conversas
-
-A V3 usa exclusivamente `http://127.0.0.1:9224` e `EdgeProfile-V3`. No Windows, o script `scripts/start-edge-cdp-v3.ps1` inicia o Edge em loopback e se recusa a iniciar se a porta já estiver ocupada; ele não apaga nem reutiliza perfis existentes. Faça login manualmente no WhatsApp Web. A V3 não abre conversas por busca de contato: `READ_CONVERSATION` lê somente a aba WhatsApp ativa e exige que o título da conversa corresponda exatamente ao `recipient_id` fornecido, com limite de até 50 mensagens.
-
-`POST /v3/tasks` aceita `READ_CONVERSATION`, `PREPARE_MESSAGE`, `SEND_MESSAGE` e `RECORD_OPT_OUT`. Toda tarefa exige `authorization.authorized_by: "auren"`. Rascunhos exigem `consent_verified: true` e uma origem de consentimento descritiva; preparar um rascunho não toca no navegador nem envia mensagem. O envio é uma tarefa separada e exige `allow_external_effects: true`, `human_approved: true` e o `approval_id` retornado com o rascunho. O adaptador confere a conversa ativa, o campo de composição e um único botão de envio; após o clique, exige observar a mensagem de saída antes de registrar `sent`. Se a confirmação for incerta, bloqueia repetição automática.
-
-Opt-outs registrados por `RECORD_OPT_OUT` ficam persistidos; frases inequívocas de interrupção encontradas em mensagens recebidas durante uma leitura também registram opt-out e bloqueiam novos rascunhos/envios. A deduplicação impede reutilizar mensagem igual para o mesmo destinatário. Há intervalo mínimo padrão de 60 segundos entre envios e teto de 10 por hora; exceder os limites exige intervenção humana. `GET /v3/tasks/{task_id}`, `GET /v3/messages/{message_id}` e `GET /v3/history/{recipient_id}` consultam tarefas e histórico persistidos.
-
-Exemplo de preparo sem envio:
-
-```json
-{
-  "task_id": "2c6b72b1-68a4-4a51-bf59-68aa96832ad5",
-  "type": "PREPARE_MESSAGE",
-  "authorization": {
-    "authorized_by": "auren",
-    "consent_verified": true
-  },
-  "payload": {
-    "recipient_id": "Nome exato da conversa ativa",
-    "body": "Mensagem aprovada para revisão",
-    "consent_source": "Origem verificável do consentimento"
-  }
-}
-```
-
-O contrato V3, a API e as regras de opt-out/ritmo foram exercitados offline com adaptadores falsos. A porta 9224, o login do WhatsApp Web, os seletores DOM, a leitura real e a confirmação de envio ainda não foram validados em navegador; nenhum envio real foi executado. `authorized_by` e `human_approved` são declarações recebidas pela API local, não uma autenticação criptográfica do Auren ou da pessoa aprovadora; mantenha a API em loopback e restrinja quem pode chamá-la.
-
 ## Configuração
 
 | Variável | Padrão | Descrição |
@@ -284,7 +279,7 @@ O contrato V3, a API e as regras de opt-out/ritmo foram exercitados offline com 
 | `SCOUT_LOG_LEVEL` | `INFO` | Nível de log. |
 | `SCOUT_CDP_ENDPOINT` | `http://127.0.0.1:9223` no V2; V1 permanece em `http://127.0.0.1:9222` | Endpoint CDP local da versão correspondente. O V2 aceita somente seu endereço loopback HTTP em `127.0.0.1:9223`; a V1 permanece isolada em `127.0.0.1:9222`. |
 | `SCOUT_V2_STATE_PATH` | `~/.auren-scout-v2/state.json` | Caminho do arquivo JSON persistente exclusivo da V2. |
-| `SCOUT_V3_STATE_PATH` | `~/.auren-scout-v3/state.json` | Caminho do arquivo JSON persistente exclusivo da V3. |
+| `SCOUT_BOSS_SHARED_SECRET` | não configurado | Segredo compartilhado HMAC com no mínimo 32 bytes; obrigatório para tarefas, consulta de tarefas e entrega de pacotes. Sem ele, esses endpoints retornam HTTP 503. Configure o mesmo segredo no processo Boss e mantenha-o fora do repositório. |
 | `SCOUT_AIVIO_GENERATION_TIMEOUT_MS` | `120000` | Timeout da espera condicional da geração do site (1000–600000 ms). |
 
 O Browser Controller valida que o endpoint fala com Microsoft Edge e não armazena credenciais, cookies ou tokens. Não configure credenciais na URL do endpoint.
@@ -313,6 +308,8 @@ Retorna o registro completo que foi armazenado durante a execução atual do pro
 ### `POST /tasks`
 
 Executa uma tarefa V2 estruturada. Os tipos aceitos são `SEARCH_LEADS`, `OPEN_COMPANY`, `GENERATE_SITE` e `HEALTH_CHECK`. A rota é adicional; `/scout/search` e `/scout/lead/:id` permanecem disponíveis com seus contratos atuais.
+
+`POST /tasks`, `GET /tasks/{task_id}`, `POST /operator/tasks`, `GET /operator/tasks/{task_id}` e as rotas `/v2/results` exigem os cabeçalhos HMAC emitidos pelo cliente `AurenBossV2Interface`. `GET /health`, `/scout/search` e `/scout/lead/:id` continuam locais sem essa assinatura. As rotas protegidas retornam HTTP 503 se `SCOUT_BOSS_SHARED_SECRET` não estiver configurado.
 
 ### `GET /tasks/{task_id}`
 
@@ -353,9 +350,9 @@ A soma é limitada a 100. Classificação: `low` 0–39, `medium` 40–69, `good
 python3 -m unittest discover -s tests -v
 ```
 
-Os testes unitários simulam o transporte CDP e não exigem Edge ativo. Para verificar a instância Edge V2 real já aberta e autorizada pelo usuário, execute `python3 -m scout browser-status`; o padrão é `http://127.0.0.1:9223`. O resultado deve conter `"connected": true`, `"browser": "Microsoft Edge"`, `tabs` com título/URL e `activeTab`. Não tente autenticar nem abrir sites automaticamente.
+Os testes unitários simulam o transporte CDP e não exigem Edge ativo. Para verificar a instância Edge V2 real já aberta e autorizada pelo usuário, execute `python3 -m scout browser-status`; o padrão é `http://127.0.0.1:9223`. O resultado deve conter `"connected": true`, `"browser": "Microsoft Edge"`, `tabs` com título/URL e `activeTab`.
 
-O teste de empacotamento executa quando PyInstaller está instalado (`python3 -m pip install -r requirements-build.txt`); no Windows, ele verifica que o artefato `.exe` é gerado.
+O teste de empacotamento executa quando PyInstaller está instalado (`python3 -m pip install -r requirements-build.txt`); no Windows, ele verifica que o artefato `.exe` é gerado. Os testes unitários de controller, ações e contratos usam transporte/páginas simulados e não contam como validação real do Edge.
 
 Os testes mockados da integração AIVIO rodam na mesma suíte. O teste real, que preenche a cidade e clica para pesquisar (podendo consumir créditos), exige opt-in separado e uma sessão AIVIO já aberta e autenticada manualmente no Edge local:
 
@@ -386,6 +383,26 @@ SCOUT_CDP_ENDPOINT=http://127.0.0.1:9223 python3 -m unittest discover -s tests -
 
 Esse teste de conexão não executa `SEARCH_LEADS`. O teste real de AIVIO em `test_aivio_live.py`, ao contrário, exige os opt-ins descritos acima e pode consumir créditos.
 
+Os testes de interação real do operador usam uma página HTTP local controlada, sem pesquisar na internet. Para ativá-los, inicie o Edge V2 manualmente em `127.0.0.1:9223`, abra qualquer página no perfil V2 e defina:
+
+```powershell
+$env:SCOUT_CDP_ENDPOINT = "http://127.0.0.1:9223"
+$env:SCOUT_BROWSER_LIVE_TEST = "1"
+python -m unittest discover -s tests -p "test_browser_operator_live.py" -v
+```
+
+Esse teste percorre a interface Python autenticada do Boss e verifica leitura, busca/paginação, tabelas/listas, clipboard, rolagem, extração com origem e pacote persistido no Edge real. Para habilitar adicionalmente uma pesquisa pública, forneça uma URL autorizada e uma consulta, e declare explicitamente que aceita possível consumo de créditos:
+
+```powershell
+$env:SCOUT_LIVE_RESEARCH_AUTHORIZED = "1"
+$env:SCOUT_LIVE_RESEARCH_ALLOW_CREDIT_CONSUMPTION = "1"
+$env:SCOUT_LIVE_RESEARCH_URL = "https://origem-publica-autorizada.example/"
+$env:SCOUT_LIVE_RESEARCH_QUERY = "cafeterias Porto Alegre"
+python -m unittest discover -s tests -p "test_browser_operator_live.py" -v
+```
+
+O caso público é ignorado sem todos os opt-ins. Escolha uma origem e consulta cuja política permita automação; não use sites que exijam contornar login, CAPTCHA, paywall ou controles de acesso.
+
 ## Limitações
 
 - `/scout/search` continua usando o catálogo sintético para demonstração. A busca real do AIVIO existe somente no executor de tarefas V2 (`/tasks` ou `python -m scout task SEARCH_LEADS`).
@@ -394,10 +411,10 @@ Esse teste de conexão não executa `SEARCH_LEADS`. O teste real de AIVIO em `te
 - A auditoria analisa somente o HTML inicial, respeita `robots.txt`, limita o download a 1 MB e não executa JavaScript. Um site pode bloquear a análise; nesse caso, os dados ficam não verificados ou a análise é marcada como bloqueada.
 - Compatibilidade mobile é estimada pela presença de `meta viewport`. Performance é tempo de resposta/download, não um resultado de Lighthouse. Aparência visual permanece não verificada sem navegador.
 - Campos não observados, como avaliações, endereço, telefone e Instagram, não são preenchidos por inferência.
-- O `LeadStore` legado permanece em memória; tarefas/leads V2 e tarefas/mensagens/opt-outs V3 ficam em arquivos JSON locais separados. A API não tem autenticação de rede; mantenha-a em loopback e restrinja quem pode chamá-la.
+- O `LeadStore` legado permanece em memória; tarefas/leads V2 ficam em arquivo JSON local. A API fica restrita a loopback; rotas de operação/entrega exigem HMAC, enquanto rotas legadas e health continuam locais sem autenticação.
 - Não há dashboard nem coleta de métricas Google.
-- A V3 ainda não foi validada contra uma sessão real do WhatsApp Web; o DOM/seletores podem exigir ajustes no perfil V3. A validação do Edge V2 em 9223 também permanece pendente neste ambiente.
+- A validação do Edge V2 em 9223 permanece pendente neste ambiente.
 
 ## Integração futura
 
-Um adaptador pode implementar `SearchProvider` em `scout/discovery.py`, respeitando os termos, limites e políticas da fonte. Ele deve retornar somente fatos com atribuição em `sources`; `CompanyResearcher` rejeita registros sem origem nos campos essenciais e remove valores opcionais/sinais sem fonte. As APIs V2/V3 aceitam tarefas explícitas que podem ser chamadas pelo Auren; não existe neste repositório um gerente Auren/Automaton que coordene as tarefas automaticamente. A ligação HTTP real entre esses componentes ainda precisa ser integrada e validada.
+Um adaptador pode implementar `SearchProvider` em `scout/discovery.py`, respeitando os termos, limites e políticas da fonte. Ele deve retornar somente fatos com atribuição em `sources`; `CompanyResearcher` rejeita registros sem origem nos campos essenciais e remove valores opcionais/sinais sem fonte. A interface Python autenticada do Boss está em `scout/boss_interface.py`; o gerente Auren/Automaton não está neste repositório e deve chamá-la explicitamente com um segredo compartilhado e permissões/origens aprovadas.

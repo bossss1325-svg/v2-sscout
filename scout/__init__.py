@@ -1,0 +1,1 @@
+"""Independent commercial research scout."""
